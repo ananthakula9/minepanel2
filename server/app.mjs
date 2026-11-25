@@ -8,24 +8,39 @@ import { spawnSync } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import { Store } from "./lib/store.mjs";
 import { hashPassword, verifyPassword, createSession, findSession, destroySession, LoginLimiter } from "./lib/auth.mjs";
-import { ProcessManager } from "./lib/procs.mjs";
+import { ProcessManager, JAR_RE } from "./lib/procs.mjs";
 import * as files from "./lib/files.mjs";
-import { PathError, validateServerId } from "./lib/paths.mjs";
-import { listVersions, downloadJar, validVersion } from "./lib/jars.mjs";
+import { PathError, safeResolve, validateServerId } from "./lib/paths.mjs";
+import { listVersions, downloadJar, searchPlugins, installPlugin, validProject, validVersion } from "./lib/jars.mjs";
+import { readLists, buildCommand } from "./lib/players.mjs";
+import { NgrokManager, validToken } from "./lib/ngrok.mjs";
+import { BACKUP_RE, BackupError, listBackups, createBackup, restoreBackup, dirSize } from "./lib/backups.mjs";
 
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "public");
 const STATIC = { "/": ["index.html", "text/html; charset=utf-8"], "/app.js": ["app.js", "text/javascript; charset=utf-8"], "/style.css": ["style.css", "text/css; charset=utf-8"] };
 const TYPES = ["paper", "vanilla", "custom"];
+const PLUGIN_FILE_RE = /^[A-Za-z0-9._+() -]{1,120}\.jar(\.disabled)?$/;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 class HttpError extends Error { constructor(status, message) { super(message); this.status = status; } }
 
-export function createApp({ dataDir, java = "java", port = 8080, host = "0.0.0.0" }) {
+export function createApp({
+  dataDir, java = "java", port = 8080, host = "0.0.0.0",
+  modrinth = { search: searchPlugins, install: installPlugin },
+  crashRestartDelayMs = 5000, backupSettleMs = 2500, sampleMs = 2000,
+  ngrokPaths, ngrokApiPort = 4040, ngrokStartTimeoutMs = 30_000, chrootCmd = "termux-chroot",
+}) {
   const store = new Store(dataDir);
   const serversDir = path.join(dataDir, "servers");
+  const backupsDir = path.join(dataDir, "backups");
   fs.mkdirSync(serversDir, { recursive: true });
-  const procs = new ProcessManager({ java, serversDir });
+  const procs = new ProcessManager({ java, serversDir, crashRestartDelayMs, sampleMs });
   const limiter = new LoginLimiter();
   const installs = new Map(); // serverId -> { state: "installing" | "failed", error? }
+  store.data.ngrok ||= {};
+  const ngrok = new NgrokManager({ getSettings: () => store.data.ngrok, candidates: ngrokPaths, apiPort: ngrokApiPort, startTimeoutMs: ngrokStartTimeoutMs, chrootCmd });
+  const busy = new Set(); // serverIds with a backup/restore in progress
+  const sizeCache = new Map(); // serverId -> { t, bytes }
 
   const javaCheck = spawnSync(java, ["-version"], { encoding: "utf8" });
   const javaOk = !javaCheck.error;
@@ -44,6 +59,8 @@ export function createApp({ dataDir, java = "java", port = 8080, host = "0.0.0.0
   sampleCpu();
   const cpuTimer = setInterval(sampleCpu, 2000); cpuTimer.unref();
 
+  const freeMb = () => { try { const s = fs.statfsSync(dataDir); return Math.round((s.bavail * s.bsize) / 1048576); } catch { return null; } };
+
   function systemInfo() {
     let storage = null;
     try { const s = fs.statfsSync(dataDir); storage = { totalMb: Math.round((s.blocks * s.bsize) / 1048576), freeMb: Math.round((s.bavail * s.bsize) / 1048576) }; } catch {}
@@ -56,6 +73,7 @@ export function createApp({ dataDir, java = "java", port = 8080, host = "0.0.0.0
   }
 
   // --- helpers ---
+  const jarOf = (s) => s.jarFile || "server.jar";
   const serverView = (s) => {
     const info = procs.info(s.id);
     const inst = installs.get(s.id);
@@ -64,11 +82,12 @@ export function createApp({ dataDir, java = "java", port = 8080, host = "0.0.0.0
     if (status === "stopped") {
       if (inst?.state === "installing") status = "installing";
       else if (inst?.state === "failed") { status = "install-failed"; error = inst.error; }
-      else if (!fs.existsSync(path.join(serversDir, s.id, "server.jar"))) status = "needs-jar";
+      else if (!fs.existsSync(path.join(serversDir, s.id, jarOf(s)))) status = "needs-jar";
     }
     return {
       id: s.id, name: s.name, type: s.type, version: s.version, port: s.port, ramMb: s.ramMb, createdAt: s.createdAt,
-      status, error, players: info.players, playerCount: info.players.length, pid: info.pid,
+      jarFile: jarOf(s), autoRestart: !!s.autoRestart, busy: busy.has(s.id), publicAddress: ngrok.addressFor(s.id),
+      status, error, players: info.players, playerCount: info.players.length, pid: info.pid, cpu: info.cpu,
       uptimeSec: info.startedAt ? Math.round((Date.now() - info.startedAt) / 1000) : null, rssMb: info.rssMb,
     };
   };
@@ -117,6 +136,15 @@ export function createApp({ dataDir, java = "java", port = 8080, host = "0.0.0.0
     return id;
   };
   const pathParam = (url) => url.searchParams.get("path") ?? "";
+  const readProps = (root) => { const pf = path.join(root, "server.properties"); return files.parseProps(fs.existsSync(pf) ? fs.readFileSync(pf, "utf8") : ""); };
+  const pluginPath = (root, name) => {
+    if (typeof name !== "string" || !PLUGIN_FILE_RE.test(name)) throw new HttpError(400, "Invalid plugin file name");
+    return safeResolve(root, `plugins/${name}`);
+  };
+  const backupPath = (id, name) => {
+    if (typeof name !== "string" || !BACKUP_RE.test(name)) throw new HttpError(400, "Invalid backup name");
+    return path.join(backupsDir, id, name);
+  };
 
   // --- routing ---
   async function handle(req, res) {
@@ -171,6 +199,36 @@ export function createApp({ dataDir, java = "java", port = 8080, host = "0.0.0.0
 
     if (p === "/api/system" && req.method === "GET") return sendJson(res, 200, systemInfo());
 
+    // ---- ngrok (one public TCP tunnel at a time) ----
+    if (p === "/api/ngrok" && req.method === "GET") {
+      const bin = await ngrok.locate(url.searchParams.get("refresh") === "1");
+      const t = store.data.ngrok.authtoken;
+      return sendJson(res, 200, { installed: !!bin, binaryPath: bin?.path ?? null, version: bin?.version ?? null, tokenSet: validToken(t), tokenHint: validToken(t) ? t.slice(-4) : null, useChroot: !!store.data.ngrok.useChroot, tunnel: ngrok.view() });
+    }
+    if (p === "/api/ngrok/settings" && req.method === "PUT") {
+      const b = await readJson(req);
+      const next = { ...store.data.ngrok };
+      if (b.authtoken !== undefined) {
+        if (b.authtoken === "") delete next.authtoken;
+        else if (validToken(b.authtoken)) next.authtoken = b.authtoken;
+        else throw new HttpError(400, "That does not look like an ngrok auth token (16 to 120 letters, numbers, _ or -). Copy it from dashboard.ngrok.com/get-started/your-authtoken");
+      }
+      if (b.useChroot !== undefined) { if (typeof b.useChroot !== "boolean") throw new HttpError(400, "useChroot must be true or false"); next.useChroot = b.useChroot; }
+      if ((b.authtoken !== undefined || b.useChroot !== undefined) && ngrok.isActive()) throw new HttpError(409, "Stop the tunnel before changing ngrok settings");
+      store.data.ngrok = next; store.save();
+      return sendJson(res, 200, { ok: true });
+    }
+    if (p === "/api/ngrok/start" && req.method === "POST") {
+      const b = await readJson(req);
+      if (typeof b.serverId !== "string") throw new HttpError(400, "Choose a server");
+      const target = getServer(b.serverId);
+      if (!validToken(store.data.ngrok.authtoken)) throw new HttpError(400, "Save your ngrok auth token first");
+      if (!(await ngrok.locate())) throw new HttpError(409, "ngrok is not installed on this device");
+      try { await ngrok.start(target.id, target.port); } catch (e) { throw new HttpError(409, e.message); }
+      return sendJson(res, 200, { tunnel: ngrok.view() });
+    }
+    if (p === "/api/ngrok/stop" && req.method === "POST") { await ngrok.stop(); return sendJson(res, 200, { tunnel: ngrok.view() }); }
+
     if (p === "/api/versions" && req.method === "GET") {
       const type = url.searchParams.get("type");
       if (!["paper", "vanilla"].includes(type)) throw new HttpError(400, "Unknown type");
@@ -205,45 +263,58 @@ export function createApp({ dataDir, java = "java", port = 8080, host = "0.0.0.0
       return sendJson(res, 201, { server: serverView(server) });
     }
 
-    const m = p.match(/^\/api\/servers\/([a-z0-9-]+)(?:\/([a-z]+))?$/);
+    const m = p.match(/^\/api\/servers\/([a-z0-9-]+)(?:\/([a-z-]+))?$/);
     if (!m) throw new HttpError(404, "Not found");
     validateServerId(m[1]);
     const server = getServer(m[1]);
     const action = m[2];
     const root = rootOf(server);
+    const id = server.id;
 
     if (!action && req.method === "GET") return sendJson(res, 200, { server: serverView(server) });
 
     if (!action && req.method === "PATCH") {
       const b = await readJson(req);
-      const running = procs.isActive(server.id);
-      if (b.name !== undefined) server.name = cleanName(b.name);
-      if (b.ramMb !== undefined) { if (running) throw new HttpError(409, "Stop the server to change RAM"); checkRam(Number(b.ramMb)); server.ramMb = Number(b.ramMb); }
-      if (b.port !== undefined) {
-        if (running) throw new HttpError(409, "Stop the server to change the port");
-        checkPort(Number(b.port), server.id); server.port = Number(b.port);
+      const running = procs.isActive(id);
+      const next = {};
+      if (b.name !== undefined) next.name = cleanName(b.name);
+      if (b.ramMb !== undefined) { if (running) throw new HttpError(409, "Stop the server to change RAM"); checkRam(Number(b.ramMb)); next.ramMb = Number(b.ramMb); }
+      if (b.port !== undefined) { if (running) throw new HttpError(409, "Stop the server to change the port"); if (ngrok.isActive(id)) throw new HttpError(409, "Stop the ngrok tunnel first. It is attached to the current port."); checkPort(Number(b.port), id); next.port = Number(b.port); }
+      if (b.jarFile !== undefined) {
+        if (running) throw new HttpError(409, "Stop the server to change the jar file");
+        if (typeof b.jarFile !== "string" || !JAR_RE.test(b.jarFile)) throw new HttpError(400, "Jar file name must end in .jar and use only letters, numbers, . _ -");
+        if (!fs.existsSync(path.join(root, b.jarFile))) throw new HttpError(400, "That file does not exist in the server folder");
+        next.jarFile = b.jarFile;
+      }
+      if (b.autoRestart !== undefined) { if (typeof b.autoRestart !== "boolean") throw new HttpError(400, "autoRestart must be true or false"); next.autoRestart = b.autoRestart; }
+      // everything validated, now apply
+      Object.assign(server, next);
+      if (next.port !== undefined) {
         const pf = path.join(root, "server.properties");
-        const cur = fs.existsSync(pf) ? fs.readFileSync(pf, "utf8") : "";
-        fs.writeFileSync(pf, files.updateProps(cur, { "server-port": String(server.port) }));
+        fs.writeFileSync(pf, files.updateProps(fs.existsSync(pf) ? fs.readFileSync(pf, "utf8") : "", { "server-port": String(server.port) }));
       }
       store.save();
       return sendJson(res, 200, { server: serverView(server) });
     }
 
     if (!action && req.method === "DELETE") {
-      if (procs.isActive(server.id)) throw new HttpError(409, "Stop the server before deleting it");
+      if (procs.isActive(id)) throw new HttpError(409, "Stop the server before deleting it");
+      if (busy.has(id)) throw new HttpError(409, "A backup is in progress");
+      if (ngrok.isActive(id)) await ngrok.stop();
       fs.rmSync(root, { recursive: true, force: true });
-      store.data.servers = store.data.servers.filter((s) => s.id !== server.id); store.save();
-      procs.recs.delete(server.id); installs.delete(server.id);
+      fs.rmSync(path.join(backupsDir, id), { recursive: true, force: true });
+      store.data.servers = store.data.servers.filter((s) => s.id !== id); store.save();
+      procs.forget(id); installs.delete(id); sizeCache.delete(id);
       return sendJson(res, 200, { ok: true });
     }
 
     if (req.method === "POST" && ["start", "stop", "restart", "kill"].includes(action)) {
-      if (installs.get(server.id)?.state === "installing") throw new HttpError(409, "Still downloading the server jar");
+      if (installs.get(id)?.state === "installing") throw new HttpError(409, "Still downloading the server jar");
+      if (busy.has(id) && ["start", "restart"].includes(action)) throw new HttpError(409, "A backup or restore is in progress. Try again in a moment.");
       let r;
       if (action === "start") r = await procs.start(server);
-      else if (action === "stop") r = procs.stop(server.id);
-      else if (action === "kill") r = procs.kill(server.id);
+      else if (action === "stop") r = procs.stop(id);
+      else if (action === "kill") r = procs.kill(id);
       else r = await procs.restart(server);
       if (!r.ok) throw new HttpError(409, r.error);
       return sendJson(res, 200, { server: serverView(server) });
@@ -253,14 +324,14 @@ export function createApp({ dataDir, java = "java", port = 8080, host = "0.0.0.0
       const b = await readJson(req);
       if (typeof b.command !== "string" || !b.command.trim() || b.command.length > 500) throw new HttpError(400, "Invalid command");
       const cmd = b.command.replace(/[\r\n\0]+/g, " ").replace(/^\//, "").trim();
-      const r = procs.command(server.id, cmd);
+      const r = procs.command(id, cmd);
       if (!r.ok) throw new HttpError(409, r.error);
       return sendJson(res, 200, { ok: true });
     }
 
     if (action === "logs" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-store", Connection: "keep-alive", "X-Accel-Buffering": "no" });
-      const rec = procs.rec(server.id);
+      const rec = procs.rec(id);
       const send = (e) => res.write(`id: ${e.id}\ndata: ${JSON.stringify({ t: e.t, line: e.line, kind: e.kind })}\n\n`);
       for (const e of rec.logs) send(e);
       rec.subs.add(send);
@@ -269,6 +340,117 @@ export function createApp({ dataDir, java = "java", port = 8080, host = "0.0.0.0
       return;
     }
 
+    if (action === "metrics" && req.method === "GET") {
+      const v = serverView(server);
+      let c = sizeCache.get(id);
+      if (!c || Date.now() - c.t > 30_000) { c = { t: Date.now(), bytes: dirSize(root) }; sizeCache.set(id, c); }
+      return sendJson(res, 200, {
+        status: v.status, cpu: v.cpu, ramMb: v.rssMb, ramLimitMb: v.ramMb, uptimeSec: v.uptimeSec,
+        playerCount: v.playerCount, players: v.players, diskMb: Math.round(c.bytes / 1048576), history: procs.history(id),
+      });
+    }
+
+    // ---- players ----
+    if (action === "players" && req.method === "GET") {
+      const props = readProps(root);
+      return sendJson(res, 200, {
+        running: procs.status(id) === "running", online: serverView(server).players, ...readLists(root),
+        whitelistEnabled: props["white-list"] === "true", onlineMode: (props["online-mode"] ?? "true") === "true",
+      });
+    }
+    if (action === "player-action" && req.method === "POST") {
+      const b = await readJson(req);
+      let cmd;
+      try { cmd = buildCommand(b.action, b.name, b.reason); } catch (e) { throw new HttpError(400, e.message); }
+      if (procs.status(id) !== "running") throw new HttpError(409, "Start the server first. Player changes are applied through the running server.");
+      const r = procs.command(id, cmd);
+      if (!r.ok) throw new HttpError(409, r.error);
+      return sendJson(res, 200, { ok: true });
+    }
+
+    // ---- plugins ----
+    if (action === "plugins" && req.method === "GET") {
+      const dir = path.join(root, "plugins");
+      const list = fs.existsSync(dir) ? fs.readdirSync(dir).filter((n) => PLUGIN_FILE_RE.test(n)).map((name) => {
+        const st = fs.statSync(path.join(dir, name));
+        return { name, size: st.size, mtime: st.mtimeMs, enabled: !name.endsWith(".disabled") };
+      }).sort((a, b) => a.name.localeCompare(b.name)) : [];
+      return sendJson(res, 200, { plugins: list, gameVersion: server.version || null, running: procs.isActive(id) });
+    }
+    if (action === "plugin-toggle" && req.method === "POST") {
+      const b = await readJson(req);
+      const from = pluginPath(root, b.name);
+      const to = b.name.endsWith(".disabled") ? from.slice(0, -".disabled".length) : from + ".disabled";
+      if (!fs.existsSync(from)) throw new HttpError(404, "Plugin not found");
+      if (fs.existsSync(to)) throw new HttpError(409, "A plugin with the target name already exists");
+      fs.renameSync(from, to);
+      return sendJson(res, 200, { ok: true });
+    }
+    if (action === "plugin-delete" && req.method === "POST") {
+      const b = await readJson(req);
+      const f = pluginPath(root, b.name);
+      if (!fs.existsSync(f)) throw new HttpError(404, "Plugin not found");
+      fs.rmSync(f);
+      return sendJson(res, 200, { ok: true });
+    }
+    if (action === "plugin-search" && req.method === "GET") {
+      const q = (url.searchParams.get("q") || "").trim();
+      if (q.length < 2 || q.length > 60) throw new HttpError(400, "Type at least 2 characters to search");
+      try { return sendJson(res, 200, { results: await modrinth.search(q, server.version), gameVersion: server.version || null }); }
+      catch (e) { throw new HttpError(502, `Could not search Modrinth: ${e.message}`); }
+    }
+    if (action === "plugin-install" && req.method === "POST") {
+      const b = await readJson(req);
+      if (!validProject(b.project)) throw new HttpError(400, "Invalid plugin id");
+      try { return sendJson(res, 200, { ok: true, ...(await modrinth.install(b.project, server.version, path.join(root, "plugins"))) }); }
+      catch (e) { throw new HttpError(502, `Could not install: ${e.message}`); }
+    }
+
+    // ---- backups ----
+    if (action === "backups" && req.method === "GET") {
+      return sendJson(res, 200, { backups: listBackups(path.join(backupsDir, id)), max: 10, freeMb: freeMb(), busy: busy.has(id) });
+    }
+    if (action === "backup-create" && req.method === "POST") {
+      if (busy.has(id)) throw new HttpError(409, "A backup or restore is already in progress");
+      const st = procs.status(id);
+      if (st === "starting" || st === "stopping") throw new HttpError(409, `Wait until the server has finished ${st === "starting" ? "starting" : "stopping"}`);
+      const free = freeMb();
+      if (free != null && free < 100) throw new HttpError(409, "Not enough free storage for a backup (need at least 100 MB)");
+      busy.add(id);
+      try {
+        const live = st === "running";
+        if (live) { procs.command(id, "save-off"); procs.command(id, "save-all flush"); await sleep(backupSettleMs); }
+        let name;
+        try { name = await createBackup(root, path.join(backupsDir, id)); }
+        finally { if (live && procs.status(id) === "running") procs.command(id, "save-on"); }
+        return sendJson(res, 200, { ok: true, name });
+      } finally { busy.delete(id); }
+    }
+    if (action === "backup-restore" && req.method === "POST") {
+      const b = await readJson(req);
+      const file = backupPath(id, b.name);
+      if (!fs.existsSync(file)) throw new HttpError(404, "Backup not found");
+      if (procs.isActive(id)) throw new HttpError(409, "Stop the server before restoring a backup");
+      if (busy.has(id)) throw new HttpError(409, "A backup or restore is already in progress");
+      busy.add(id);
+      try { await restoreBackup(file, serversDir, id); sizeCache.delete(id); return sendJson(res, 200, { ok: true }); }
+      finally { busy.delete(id); }
+    }
+    if (action === "backup-delete" && req.method === "POST") {
+      const b = await readJson(req);
+      const file = backupPath(id, b.name);
+      if (!fs.existsSync(file)) throw new HttpError(404, "Backup not found");
+      fs.rmSync(file);
+      return sendJson(res, 200, { ok: true });
+    }
+    if (action === "backup-download" && req.method === "GET") {
+      const file = backupPath(id, url.searchParams.get("name"));
+      if (!fs.existsSync(file)) throw new HttpError(404, "Backup not found");
+      res.writeHead(200, { "Content-Type": "application/gzip", "Content-Length": fs.statSync(file).size, "Content-Disposition": `attachment; filename="${path.basename(file)}"` });
+      return pipeline(fs.createReadStream(file), res);
+    }
+
+    // ---- files ----
     if (action === "files" && req.method === "GET") return sendJson(res, 200, { path: pathParam(url), entries: files.list(root, pathParam(url)) });
     if (action === "file" && req.method === "GET") return sendJson(res, 200, { content: files.readText(root, pathParam(url)) });
     if (action === "file" && req.method === "PUT") {
@@ -301,10 +483,7 @@ export function createApp({ dataDir, java = "java", port = 8080, host = "0.0.0.0
       return sendJson(res, 200, { ok: true });
     }
 
-    if (action === "properties" && req.method === "GET") {
-      const pf = path.join(root, "server.properties");
-      return sendJson(res, 200, { properties: files.parseProps(fs.existsSync(pf) ? fs.readFileSync(pf, "utf8") : "") });
-    }
+    if (action === "properties" && req.method === "GET") return sendJson(res, 200, { properties: readProps(root) });
     if (action === "properties" && req.method === "PUT") {
       const b = await readJson(req);
       const upd = {};
@@ -331,6 +510,7 @@ export function createApp({ dataDir, java = "java", port = 8080, host = "0.0.0.0
       if (res.headersSent) return res.destroy();
       if (e instanceof HttpError) return sendJson(res, e.status, { error: e.message });
       if (e instanceof PathError) return sendJson(res, 400, { error: e.message });
+      if (e instanceof BackupError) return sendJson(res, 409, { error: e.message });
       if (e?.code === "ENOENT") return sendJson(res, 404, { error: "File or folder not found" });
       console.error(e);
       sendJson(res, 500, { error: "Internal error" });
@@ -340,6 +520,6 @@ export function createApp({ dataDir, java = "java", port = 8080, host = "0.0.0.0
   return {
     httpServer, procs, store,
     listen: () => new Promise((resolve) => httpServer.listen(port, host, () => resolve(httpServer.address().port))),
-    close: async () => { await procs.shutdownAll(); clearInterval(cpuTimer); httpServer.closeAllConnections?.(); await new Promise((r) => httpServer.close(r)); },
+    close: async () => { await ngrok.stop(); await procs.shutdownAll(); clearInterval(cpuTimer); httpServer.closeAllConnections?.(); await new Promise((r) => httpServer.close(r)); },
   };
 }
