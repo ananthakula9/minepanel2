@@ -1,7 +1,7 @@
 // MinePanel UI. No framework, no build step.
 // All dynamic text goes through textContent/createTextNode, so nothing a server prints can inject HTML.
 const root = document.getElementById("app");
-const VERSION = "0.4.0";
+const VERSION = "0.6.0";
 let timers = [];
 let closers = [];
 
@@ -365,7 +365,7 @@ async function serverView(id, tab) {
           h("h1", {}, server.name, pill(server.status)),
           h("p", { class: "sub" }, `${server.type === "custom" ? "Custom jar" : `${server.type} ${server.version}`} · ${server.publicAddress ? "Home Wi-Fi " : ""}`, h("span", { class: "addr" }, addrOf(server)),
             h("button", { class: "copy", onclick: () => copyText(addrOf(server)) }, "Copy")),
-          server.publicAddress && h("p", { class: "sub" }, "Public (ngrok) ", h("span", { class: "addr" }, server.publicAddress),
+          server.publicAddress && h("p", { class: "sub" }, "Public ", h("span", { class: "addr" }, server.publicAddress),
             h("button", { class: "copy", onclick: () => copyText(server.publicAddress) }, "Copy"))),
         h("div", { class: "actions" },
           mk("Start", "primary", !active && server.status !== "installing" && !server.busy, "start"),
@@ -609,88 +609,84 @@ function pluginsTab(id, body) {
 
 function onlineTab(id, body, getServer) {
   const box = h("div");
-  const tokenIn = h("input", { type: "password", placeholder: "Paste your ngrok authtoken", autocomplete: "off", autocapitalize: "off", spellcheck: "false", "aria-label": "ngrok auth token" });
+  const addrIn = h("input", { type: "text", placeholder: "name.craft.playit.gg", autocomplete: "off", autocapitalize: "off", spellcheck: "false", "aria-label": "Tunnel address" });
+  const secretIn = h("input", { type: "password", placeholder: "Secret key (optional)", autocomplete: "off", autocapitalize: "off", spellcheck: "false", "aria-label": "playit secret key" });
   body.append(box);
-  let data = null, names = {}, onlineMode = true, sig = "";
+  let data = null, onlineMode = true, sig = "", seeded = false;
 
   const act = async (fn, ok) => { try { await fn(); if (ok) toast(ok); } catch (e) { toast(e.message, "err"); } await load(); };
-  const stateLabel = { idle: ["", "Not connected"], starting: ["starting", "Connecting…"], online: ["running", "Online"], error: ["needs-jar", "Error"] };
+  const stateLabel = { idle: ["", "Agent stopped"], starting: ["starting", "Starting…"], running: ["running", "Agent running"], error: ["needs-jar", "Error"] };
   const mkPill = (state) => { const [cls, label] = stateLabel[state] || ["", state]; return h("span", { class: `pill ${cls}` }, h("i", { class: "dot" }), label); };
   const stepHead = (n, title, ok) => h("div", { class: "card-head" }, h("h3", {}, `${n}. ${title}`), h("span", { class: `pill ${ok ? "running" : "needs-jar"}` }, h("i", { class: "dot" }), ok ? "Done" : "To do"));
 
   function render() {
-    const d = data, t = d.tunnel, srv = getServer();
-    const active = t.state === "starting" || t.state === "online";
-    const mine = t.serverId === id;
-    const lan = addrOf(srv);
-    const tokenBtn = h("button", { class: "btn primary", onclick: async () => {
-      const v = tokenIn.value.trim();
-      if (!v) { toast("Paste your auth token first.", "err"); tokenIn.focus(); return; }
-      await act(async () => { await api("PUT", "/api/ngrok/settings", { authtoken: v }); tokenIn.value = ""; }, "Token saved.");
-    }, disabled: active, title: active ? "Stop the tunnel first" : "" }, d.tokenSet ? "Replace token" : "Save token");
+    const d = data, a = d.agent, srv = getServer();
+    const active = a.state === "starting" || a.state === "running";
+    const mine = d.addresses[id] || "";
+    if (!seeded) { addrIn.value = mine; seeded = true; }
 
     put(box,
-      h("div", { class: "card" }, h("h3", {}, "Let friends join from anywhere (ngrok)"),
-        h("p", { class: "sub", style: "margin:0 0 8px" }, "ngrok gives this server a public address, so friends outside your home can join without any router settings. Traffic passes through ngrok's servers."),
+      h("div", { class: "card" }, h("h3", {}, "Let friends join from anywhere (playit.gg)"),
+        h("p", { class: "sub", style: "margin:0 0 8px" }, "playit.gg gives this server a public address without any router settings. Traffic goes through playit's servers."),
         h("ul", { class: "muted", style: "margin:0;padding-left:18px;font-size:13px" },
-          h("li", {}, "On the free plan, ngrok needs a credit or debit card on your account for TCP tunnels. It is not charged."),
-          h("li", {}, "The public address changes every time you start the tunnel. Send friends the new one."),
-          h("li", {}, "Free plans have a monthly data limit, and allow one tunnel at a time."))),
+          h("li", {}, h("b", {}, "India: "), "playit has a datacenter in India. On a free (Global Anycast) tunnel each player is routed to the datacenter nearest them, decided mostly by their internet provider, so players in India normally land on it. You cannot force a region, and recreating a free tunnel does not change that. Pinning a region is a Premium feature. This panel cannot choose or retry it."),
+          h("li", {}, "To see where a player lands, have them open ", h("a", { href: "https://ping.playit.gg", target: "_blank", rel: "noopener" }, "ping.playit.gg"), ". If it shows somewhere far away, a Premium regional tunnel is the fix."),
+          h("li", {}, "The tunnel itself (its address and region) is made on playit.gg. This tab runs the agent and shows the address."))),
       !onlineMode && h("div", { class: "banner err", style: "margin-top:14px" },
-        h("b", {}, "Online mode is OFF. "), "Once this server has a public address, anyone on the internet who finds it can join with any name, including an operator's name, and get operator powers. Turn online mode on before you start the tunnel (everyone then needs a real Minecraft account). ",
+        h("b", {}, "Online mode is OFF. "), "A public server with online mode off lets anyone join with any name, including an operator's name. Turn it on before sharing the address (everyone then needs a real Minecraft account). ",
         h("button", { class: "btn small", style: "margin-top:8px", onclick: () => act(() => api("PUT", `/api/servers/${id}/properties`, { properties: { "online-mode": "true" } }), "Online mode turned on. Restart the server to apply.") }, "Turn on online mode")),
 
-      h("div", { class: "card" }, stepHead(1, "Install ngrok on this phone", d.installed),
+      h("div", { class: "card" }, stepHead(1, "Install the playit agent", d.installed),
         d.installed
-          ? h("div", {}, h("div", { class: "meta", style: "margin-top:0" }, `Found: ${d.binaryPath} (${d.version})`), h("button", { class: "btn small", onclick: () => load(true) }, "Re-check"))
+          ? h("div", {}, h("div", { class: "meta", style: "margin-top:0" }, `Found: ${d.binaryPath}${d.version ? ` (${d.version})` : ""}`), h("button", { class: "btn small", onclick: () => load(true) }, "Re-check"))
           : h("div", {},
-              h("p", { class: "sub", style: "margin:0 0 6px" }, "ngrok was not found. Install it once:"),
-              h("ol", { style: "margin:0 0 8px;padding-left:20px;font-size:14px" },
-                h("li", {}, "In your phone's browser open ", h("a", { href: "https://ngrok.com/download", target: "_blank", rel: "noopener" }, "ngrok.com/download"), ", choose Linux and ARM64, and download the file."),
-                h("li", {}, "In Termux, unpack it and move it to your home folder (change the file name if yours differs):")),
-              h("pre", { class: "code" }, "termux-setup-storage\ncd ~/storage/downloads\ntar -xzf ngrok-*.tgz\nmv ngrok ~/\nchmod +x ~/ngrok"),
-              h("p", { class: "muted", style: "font-size:13px;margin:0 0 8px" }, "The panel looks for ngrok on your PATH and at ~/ngrok. Then press Re-check."),
+              h("p", { class: "sub", style: "margin:0 0 6px" }, "playit was not found. In Termux, run this once (it downloads the official ARM64 build):"),
+              h("pre", { class: "code" }, "curl -SsL -o ~/playit https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-aarch64\nchmod +x ~/playit"),
+              h("p", { class: "muted", style: "font-size:13px;margin:0 0 8px" }, "The panel looks for playit on your PATH and at ~/playit. Then press Re-check."),
               h("button", { class: "btn small", onclick: () => load(true) }, "Re-check"))),
 
-      h("div", { class: "card" }, stepHead(2, "Add your ngrok auth token", d.tokenSet),
-        h("p", { class: "sub", style: "margin:0 0 8px" }, "Sign up at ", h("a", { href: "https://dashboard.ngrok.com/signup", target: "_blank", rel: "noopener" }, "ngrok.com"), ", then copy your token from ", h("a", { href: "https://dashboard.ngrok.com/get-started/your-authtoken", target: "_blank", rel: "noopener" }, "dashboard.ngrok.com/get-started/your-authtoken"), "."),
-        d.tokenSet && h("div", { class: "meta", style: "margin-top:0" }, `Token saved (ends in …${d.tokenHint}). It is stored only on this phone and is never shown again.`),
-        h("div", { class: "inline" }, tokenIn, tokenBtn,
-          d.tokenSet && h("button", { class: "btn danger", disabled: active, title: active ? "Stop the tunnel first" : "", onclick: async () => { if (await confirmBox("Remove the saved token?", "ngrok will stop working until you save a token again.", "Remove", true)) act(() => api("PUT", "/api/ngrok/settings", { authtoken: "" }), "Token removed."); } }, "Remove"))),
+      h("div", { class: "card" }, h("div", { class: "card-head" }, h("h3", {}, "2. Connect the agent to your account"), mkPill(a.state)),
+        h("p", { class: "sub", style: "margin:0 0 8px" }, "Easiest: press Start agent. If it prints a claim link, a button appears below. Open it and sign in to playit.gg. ",
+          "Or, to use a secret key: on ", h("a", { href: "https://playit.gg/account/agents", target: "_blank", rel: "noopener" }, "playit.gg/account/agents"), " create an agent, copy its secret key, and save it here."),
+        d.secretSet && h("div", { class: "meta", style: "margin-top:0" }, `Secret key saved (ends in …${d.secretHint}${d.secretSource === ".env" ? ", from .env" : ""}). It is never shown again.`),
+        h("div", { class: "inline" }, secretIn,
+          h("button", { class: "btn", disabled: active, title: active ? "Stop the agent first" : "", onclick: async () => { const v = secretIn.value.trim(); if (!v) { toast("Paste the secret key first.", "err"); secretIn.focus(); return; } await act(async () => { await api("PUT", "/api/playit/settings", { secret: v }); secretIn.value = ""; }, "Secret key saved."); } }, d.secretSet ? "Replace key" : "Save key"),
+          d.secretSource === "panel" && h("button", { class: "btn danger", disabled: active, onclick: async () => { if (await confirmBox("Remove the saved secret key?", "The agent will need to be linked again with a claim link.", "Remove", true)) act(() => api("PUT", "/api/playit/settings", { secret: "" }), "Secret key removed."); } }, "Remove")),
+        a.claimUrl && h("div", { class: "banner info", style: "margin-top:12px" }, "playit wants you to link this phone to your account: ", h("a", { href: a.claimUrl, target: "_blank", rel: "noopener" }, "open the claim link")),
+        a.state === "error" && h("div", { class: "banner err", role: "alert", style: "margin-top:12px" }, h("b", {}, a.error), a.hint && h("div", { style: "margin-top:6px" }, a.hint)),
+        a.state === "running" && h("div", { class: "muted", style: "font-size:13px;margin-top:10px" }, "The agent program is running. Check that it shows as Online on playit.gg/account/agents, and read its output below if it does not."),
+        h("div", { class: "actions", style: "margin-top:12px" },
+          h("button", { class: "btn primary", disabled: !d.installed || active, title: !d.installed ? "Install playit first" : "", onclick: () => act(() => api("POST", "/api/playit/start", {}), null) }, "Start agent"),
+          h("button", { class: "btn", disabled: !active, onclick: () => act(() => api("POST", "/api/playit/stop", {}), "Agent stopped.") }, "Stop agent")),
+        a.logs.length > 0 && h("details", { style: "margin-top:12px" }, h("summary", { class: "muted", style: "cursor:pointer;font-size:13px" }, "playit output (for troubleshooting)"),
+          h("div", { class: "console", style: "height:auto;max-height:220px;margin-top:8px" }, a.logs.map((l) => h("div", {}, l))))),
 
-      h("div", { class: "card" }, h("div", { class: "card-head" }, h("h3", {}, "3. Start the tunnel"), mkPill(t.state === "idle" || mine || !active ? t.state : "idle")),
-        active && !mine && h("div", { class: "banner info" }, `ngrok is currently connected to ${names[t.serverId] || "another server"}. Free plans allow one tunnel, so starting here will stop that one.`),
-        srv.status !== "running" && h("div", { class: "banner" }, "This server is not running. Start it too, or players will not be able to join."),
-        t.state === "online" && mine && h("div", { style: "margin-bottom:12px" },
+      h("div", { class: "card" }, stepHead(3, "Create the tunnel and paste its address", !!mine),
+        h("ol", { style: "margin:0 0 10px;padding-left:20px;font-size:14px" },
+          h("li", {}, "On ", h("a", { href: "https://playit.gg/account/tunnels", target: "_blank", rel: "noopener" }, "playit.gg/account/tunnels"), " press Add Tunnel and choose Minecraft Java."),
+          h("li", {}, "Set the local address to ", h("b", {}, `localhost:${srv.port}`), " (this server's port). Pick your region there if you have Premium."),
+          h("li", {}, "Copy the address playit gives you and paste it here.")),
+        h("div", { class: "field" }, h("label", { for: "pl-addr" }, "Tunnel address for this server"), h("div", { class: "inline" }, Object.assign(addrIn, { id: "pl-addr" }),
+          h("button", { class: "btn primary", onclick: () => act(async () => { await api("PUT", "/api/playit/address", { serverId: id, address: addrIn.value.trim() }); }, addrIn.value.trim() ? "Address saved." : "Address removed.") }, "Save address"))),
+        mine && h("div", { style: "margin-top:4px" },
           h("div", { class: "muted", style: "font-size:13px" }, "Friends join with this address (Minecraft → Multiplayer → Add Server):"),
-          h("div", { class: "big-addr" }, t.address, h("button", { class: "copy", style: "font-size:13px", onclick: () => copyText(t.address) }, "Copy")),
-          h("div", { class: "muted", style: "font-size:13px;margin-top:6px" }, `Your home Wi-Fi address is still ${lan}. The public address is now also shown at the top of this page.`)),
-        t.state === "starting" && mine && h("div", { class: "muted", style: "margin-bottom:12px" }, "Connecting to ngrok… this usually takes a few seconds."),
-        t.state === "error" && (mine || t.serverId == null || true) && h("div", { class: "banner err", role: "alert" }, h("b", {}, t.error), t.hint && h("div", { style: "margin-top:6px" }, t.hint)),
-        h("div", { class: "actions" },
-          h("button", { class: "btn primary", disabled: !d.installed || !d.tokenSet || (active && mine), title: !d.installed ? "Install ngrok first" : !d.tokenSet ? "Save your token first" : "", onclick: () => act(() => api("POST", "/api/ngrok/start", { serverId: id }), null) }, active && !mine ? "Switch tunnel to this server" : "Start tunnel"),
-          h("button", { class: "btn", disabled: !active, onclick: () => act(() => api("POST", "/api/ngrok/stop", {}), "Tunnel stopped.") }, "Stop tunnel")),
-        t.logs.length > 0 && h("details", { style: "margin-top:12px" }, h("summary", { class: "muted", style: "cursor:pointer;font-size:13px" }, "ngrok output (for troubleshooting)"),
-          h("div", { class: "console", style: "height:auto;max-height:220px;margin-top:8px" }, t.logs.map((l) => h("div", {}, l))))),
-
-      h("div", { class: "card" }, h("h3", {}, "Advanced"),
-        h("label", { class: "check", for: "chroot" }, h("input", { type: "checkbox", id: "chroot", checked: d.useChroot, disabled: active, onchange: (e) => act(() => api("PUT", "/api/ngrok/settings", { useChroot: e.target.checked }), null) }), h("span", {}, "Run ngrok through termux-chroot")),
-        h("div", { class: "hint muted", style: "font-size:12px;margin-top:6px" }, "Try this if the output shows a DNS error mentioning [::1]:53. First run in Termux: pkg install proot")));
+          h("div", { class: "big-addr" }, mine, h("button", { class: "copy", style: "font-size:13px", onclick: () => copyText(mine) }, "Copy")),
+          srv.status !== "running" && h("div", { class: "banner", style: "margin-top:8px" }, "This server is not running, so nobody can join yet."))));
   }
 
   async function load(refresh) {
     try {
-      const [d, sv, pr] = await Promise.all([api("GET", `/api/ngrok${refresh === true ? "?refresh=1" : ""}`), api("GET", "/api/servers"), api("GET", `/api/servers/${id}/properties`)]);
-      names = Object.fromEntries(sv.servers.map((x) => [x.id, x.name]));
+      const [d, pr] = await Promise.all([api("GET", `/api/playit${refresh === true ? "?refresh=1" : ""}`), api("GET", `/api/servers/${id}/properties`)]);
       onlineMode = (pr.properties["online-mode"] ?? "true") === "true";
-      const next = JSON.stringify([d, onlineMode, getServer().status, names[d.tunnel.serverId]]);
+      const next = JSON.stringify([d, onlineMode, getServer().status, getServer().port]);
       if (next === sig && refresh !== true) return;
-      if (document.activeElement === tokenIn) { data = d; return; } // never rebuild while the token is being typed
-      data = d; sig = next; render();
+      data = d;
+      if ([addrIn, secretIn].includes(document.activeElement)) return; // never rebuild while typing
+      sig = next; render();
     } catch (e) { put(box, h("div", { class: "banner err" }, e.message)); }
   }
   load();
-  timers.push(setInterval(load, 2000));
+  timers.push(setInterval(load, 2500));
 }
 
 function backupsTab(id, body, getServer, refreshHeader) {

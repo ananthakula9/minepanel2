@@ -13,7 +13,7 @@ import * as files from "./lib/files.mjs";
 import { PathError, safeResolve, validateServerId } from "./lib/paths.mjs";
 import { listVersions, downloadJar, searchPlugins, installPlugin, validProject, validVersion } from "./lib/jars.mjs";
 import { readLists, buildCommand } from "./lib/players.mjs";
-import { NgrokManager, validToken } from "./lib/ngrok.mjs";
+import { PlayitManager, validSecret, cleanAddress } from "./lib/playit.mjs";
 import { BACKUP_RE, BackupError, listBackups, createBackup, restoreBackup, dirSize } from "./lib/backups.mjs";
 
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "public");
@@ -28,7 +28,7 @@ export function createApp({
   dataDir, java = "java", port = 8080, host = "0.0.0.0",
   modrinth = { search: searchPlugins, install: installPlugin },
   crashRestartDelayMs = 5000, backupSettleMs = 2500, sampleMs = 2000,
-  ngrokPaths, ngrokApiPort = 4040, ngrokStartTimeoutMs = 30_000, chrootCmd = "termux-chroot",
+  playit: playitEnv = {}, playitPaths, playitGraceMs,
 }) {
   const store = new Store(dataDir);
   const serversDir = path.join(dataDir, "servers");
@@ -37,8 +37,13 @@ export function createApp({
   const procs = new ProcessManager({ java, serversDir, crashRestartDelayMs, sampleMs });
   const limiter = new LoginLimiter();
   const installs = new Map(); // serverId -> { state: "installing" | "failed", error? }
-  store.data.ngrok ||= {};
-  const ngrok = new NgrokManager({ getSettings: () => store.data.ngrok, candidates: ngrokPaths, apiPort: ngrokApiPort, startTimeoutMs: ngrokStartTimeoutMs, chrootCmd });
+  // Older versions kept ngrok / DuckDNS settings here. Those features are gone, so wipe their tokens.
+  for (const k of ["ngrok", "duckdns"]) if (store.data[k]) { delete store.data[k]; store.save(); }
+  store.data.playit ||= {};
+  store.data.playit.addresses ||= {};
+  // A secret saved in the panel wins; PLAYIT_SECRET from .env is the fallback.
+  const playitSettings = () => ({ secret: store.data.playit.secret ?? playitEnv.secret });
+  const playit = new PlayitManager({ getSettings: playitSettings, candidates: playitPaths, graceMs: playitGraceMs });
   const busy = new Set(); // serverIds with a backup/restore in progress
   const sizeCache = new Map(); // serverId -> { t, bytes }
 
@@ -86,7 +91,7 @@ export function createApp({
     }
     return {
       id: s.id, name: s.name, type: s.type, version: s.version, port: s.port, ramMb: s.ramMb, createdAt: s.createdAt,
-      jarFile: jarOf(s), autoRestart: !!s.autoRestart, busy: busy.has(s.id), publicAddress: ngrok.addressFor(s.id),
+      jarFile: jarOf(s), autoRestart: !!s.autoRestart, busy: busy.has(s.id), publicAddress: store.data.playit.addresses[s.id] ?? null,
       status, error, players: info.players, playerCount: info.players.length, pid: info.pid, cpu: info.cpu,
       uptimeSec: info.startedAt ? Math.round((Date.now() - info.startedAt) / 1000) : null, rssMb: info.rssMb,
     };
@@ -136,6 +141,13 @@ export function createApp({
     return id;
   };
   const pathParam = (url) => url.searchParams.get("path") ?? "";
+  // A non-blank server-ip makes Minecraft bind to one address only, which breaks IPv6 hosting. Keep it blank.
+  const blankServerIp = (root) => {
+    const pf = path.join(root, "server.properties");
+    if (!fs.existsSync(pf)) return;
+    const text = fs.readFileSync(pf, "utf8");
+    if ((files.parseProps(text)["server-ip"] ?? "") !== "") fs.writeFileSync(pf, files.updateProps(text, { "server-ip": "" }));
+  };
   const readProps = (root) => { const pf = path.join(root, "server.properties"); return files.parseProps(fs.existsSync(pf) ? fs.readFileSync(pf, "utf8") : ""); };
   const pluginPath = (root, name) => {
     if (typeof name !== "string" || !PLUGIN_FILE_RE.test(name)) throw new HttpError(400, "Invalid plugin file name");
@@ -199,35 +211,39 @@ export function createApp({
 
     if (p === "/api/system" && req.method === "GET") return sendJson(res, 200, systemInfo());
 
-    // ---- ngrok (one public TCP tunnel at a time) ----
-    if (p === "/api/ngrok" && req.method === "GET") {
-      const bin = await ngrok.locate(url.searchParams.get("refresh") === "1");
-      const t = store.data.ngrok.authtoken;
-      return sendJson(res, 200, { installed: !!bin, binaryPath: bin?.path ?? null, version: bin?.version ?? null, tokenSet: validToken(t), tokenHint: validToken(t) ? t.slice(-4) : null, useChroot: !!store.data.ngrok.useChroot, tunnel: ngrok.view() });
-    }
-    if (p === "/api/ngrok/settings" && req.method === "PUT") {
+    // ---- playit.gg ----
+    const playitView = async (refresh) => {
+      const bin = await playit.locate(refresh);
+      const sec = playitSettings().secret;
+      return { installed: !!bin, binaryPath: bin?.path ?? null, version: bin?.version ?? null,
+        secretSet: validSecret(sec), secretHint: validSecret(sec) ? sec.slice(-4) : null, secretSource: store.data.playit.secret !== undefined ? "panel" : playitEnv.secret ? ".env" : null,
+        agent: playit.view(), addresses: store.data.playit.addresses };
+    };
+    if (p === "/api/playit" && req.method === "GET") return sendJson(res, 200, await playitView(url.searchParams.get("refresh") === "1"));
+    if (p === "/api/playit/settings" && req.method === "PUT") {
       const b = await readJson(req);
-      const next = { ...store.data.ngrok };
-      if (b.authtoken !== undefined) {
-        if (b.authtoken === "") delete next.authtoken;
-        else if (validToken(b.authtoken)) next.authtoken = b.authtoken;
-        else throw new HttpError(400, "That does not look like an ngrok auth token (16 to 120 letters, numbers, _ or -). Copy it from dashboard.ngrok.com/get-started/your-authtoken");
-      }
-      if (b.useChroot !== undefined) { if (typeof b.useChroot !== "boolean") throw new HttpError(400, "useChroot must be true or false"); next.useChroot = b.useChroot; }
-      if ((b.authtoken !== undefined || b.useChroot !== undefined) && ngrok.isActive()) throw new HttpError(409, "Stop the tunnel before changing ngrok settings");
-      store.data.ngrok = next; store.save();
-      return sendJson(res, 200, { ok: true });
+      if (b.secret === undefined) throw new HttpError(400, "Nothing to change");
+      if (playit.isActive()) throw new HttpError(409, "Stop the playit agent before changing the secret key");
+      if (b.secret === "") delete store.data.playit.secret;
+      else if (validSecret(b.secret)) store.data.playit.secret = b.secret;
+      else throw new HttpError(400, "That does not look like a playit secret key (letters, numbers, - or _, at least 16 characters). Copy it from playit.gg/account/agents.");
+      store.save();
+      return sendJson(res, 200, await playitView());
     }
-    if (p === "/api/ngrok/start" && req.method === "POST") {
+    if (p === "/api/playit/address" && req.method === "PUT") {
       const b = await readJson(req);
-      if (typeof b.serverId !== "string") throw new HttpError(400, "Choose a server");
       const target = getServer(b.serverId);
-      if (!validToken(store.data.ngrok.authtoken)) throw new HttpError(400, "Save your ngrok auth token first");
-      if (!(await ngrok.locate())) throw new HttpError(409, "ngrok is not installed on this device");
-      try { await ngrok.start(target.id, target.port); } catch (e) { throw new HttpError(409, e.message); }
-      return sendJson(res, 200, { tunnel: ngrok.view() });
+      if (b.address === "" || b.address === null) delete store.data.playit.addresses[target.id];
+      else { const a = cleanAddress(b.address); if (!a) throw new HttpError(400, "That does not look like an address. Copy it from your tunnel on playit.gg/account/tunnels (like name.craft.playit.gg)."); store.data.playit.addresses[target.id] = a; }
+      store.save();
+      return sendJson(res, 200, await playitView());
     }
-    if (p === "/api/ngrok/stop" && req.method === "POST") { await ngrok.stop(); return sendJson(res, 200, { tunnel: ngrok.view() }); }
+    if (p === "/api/playit/start" && req.method === "POST") {
+      if (!(await playit.locate())) throw new HttpError(409, "playit is not installed on this device");
+      try { await playit.start(); } catch (e) { throw new HttpError(409, e.message); }
+      return sendJson(res, 200, await playitView());
+    }
+    if (p === "/api/playit/stop" && req.method === "POST") { await playit.stop(); return sendJson(res, 200, await playitView()); }
 
     if (p === "/api/versions" && req.method === "GET") {
       const type = url.searchParams.get("type");
@@ -252,7 +268,7 @@ export function createApp({
       const dir = rootOf(server);
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(path.join(dir, "eula.txt"), "# Accepted by the panel owner when creating this server\neula=true\n");
-      fs.writeFileSync(path.join(dir, "server.properties"), `server-port=${srvPort}\nmotd=${name.replace(/[\\=]/g, "")}\n`);
+      fs.writeFileSync(path.join(dir, "server.properties"), `server-ip=\nserver-port=${srvPort}\nmotd=${name.replace(/[\\=]/g, "")}\n`);
       store.data.servers.push(server); store.save();
       if (b.type !== "custom") {
         installs.set(id, { state: "installing" });
@@ -279,7 +295,7 @@ export function createApp({
       const next = {};
       if (b.name !== undefined) next.name = cleanName(b.name);
       if (b.ramMb !== undefined) { if (running) throw new HttpError(409, "Stop the server to change RAM"); checkRam(Number(b.ramMb)); next.ramMb = Number(b.ramMb); }
-      if (b.port !== undefined) { if (running) throw new HttpError(409, "Stop the server to change the port"); if (ngrok.isActive(id)) throw new HttpError(409, "Stop the ngrok tunnel first. It is attached to the current port."); checkPort(Number(b.port), id); next.port = Number(b.port); }
+      if (b.port !== undefined) { if (running) throw new HttpError(409, "Stop the server to change the port"); checkPort(Number(b.port), id); next.port = Number(b.port); }
       if (b.jarFile !== undefined) {
         if (running) throw new HttpError(409, "Stop the server to change the jar file");
         if (typeof b.jarFile !== "string" || !JAR_RE.test(b.jarFile)) throw new HttpError(400, "Jar file name must end in .jar and use only letters, numbers, . _ -");
@@ -300,7 +316,7 @@ export function createApp({
     if (!action && req.method === "DELETE") {
       if (procs.isActive(id)) throw new HttpError(409, "Stop the server before deleting it");
       if (busy.has(id)) throw new HttpError(409, "A backup is in progress");
-      if (ngrok.isActive(id)) await ngrok.stop();
+      delete store.data.playit.addresses[id]; store.save();
       fs.rmSync(root, { recursive: true, force: true });
       fs.rmSync(path.join(backupsDir, id), { recursive: true, force: true });
       store.data.servers = store.data.servers.filter((s) => s.id !== id); store.save();
@@ -312,6 +328,7 @@ export function createApp({
       if (installs.get(id)?.state === "installing") throw new HttpError(409, "Still downloading the server jar");
       if (busy.has(id) && ["start", "restart"].includes(action)) throw new HttpError(409, "A backup or restore is in progress. Try again in a moment.");
       let r;
+      if (["start", "restart"].includes(action)) blankServerIp(root);
       if (action === "start") r = await procs.start(server);
       else if (action === "stop") r = procs.stop(id);
       else if (action === "kill") r = procs.kill(id);
@@ -491,6 +508,7 @@ export function createApp({
         if (!/^[a-z0-9.-]{1,64}$/.test(k)) throw new HttpError(400, `Invalid key: ${k}`);
         if (typeof v !== "string" || /[\r\n\0]/.test(v) || v.length > 500) throw new HttpError(400, `Invalid value for ${k}`);
         if (k === "server-port") continue; // managed in Settings so ports stay unique
+        if (k === "server-ip") continue;   // must stay blank so the server listens on every interface, including IPv6
         upd[k] = v;
       }
       const pf = path.join(root, "server.properties");
@@ -519,7 +537,8 @@ export function createApp({
 
   return {
     httpServer, procs, store,
+    playit,
     listen: () => new Promise((resolve) => httpServer.listen(port, host, () => resolve(httpServer.address().port))),
-    close: async () => { await ngrok.stop(); await procs.shutdownAll(); clearInterval(cpuTimer); httpServer.closeAllConnections?.(); await new Promise((r) => httpServer.close(r)); },
+    close: async () => { await playit.stop(); await procs.shutdownAll(); clearInterval(cpuTimer); httpServer.closeAllConnections?.(); await new Promise((r) => httpServer.close(r)); },
   };
 }

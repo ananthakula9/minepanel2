@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
 import net from "node:net";
-import { NgrokManager, diagnose, validToken } from "../server/lib/ngrok.mjs";
+import { PlayitManager, cleanAddress, validSecret, diagnose } from "../server/lib/playit.mjs";
+import { createApp as createApp2 } from "../server/app.mjs";
 import { createApp } from "../server/app.mjs";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mp-test-"));
@@ -13,6 +14,7 @@ const fakeJava = path.join(tmp, "fake-java.mjs");
 fs.writeFileSync(fakeJava, `#!/usr/bin/env node
 console.log('[Server thread/INFO]: Starting minecraft server');
 setTimeout(() => console.log('[Server thread/INFO]: Done (0.3s)! For help, type "help"'), 150);
+console.log('ARGV: ' + process.argv.slice(2).join(' '));
 process.stdin.on('data', (d) => {
   for (const l of d.toString().split('\\n').filter(Boolean)) {
     if (l === 'stop') { console.log('Stopping server'); process.exit(0); }
@@ -25,35 +27,23 @@ process.stdin.on('data', (d) => {
 `, { mode: 0o755 });
 
 
-// ---- fake ngrok: behaves like the real agent for each kind of token, so every path can be tested ----
-const fakeNgrok = path.join(tmp, "fake-ngrok.mjs");
-fs.writeFileSync(fakeNgrok, `#!/usr/bin/env node
-import fs from 'node:fs'; import http from 'node:http';
+// ---- fake playit agent: behaves differently for each kind of secret so every path can be tested ----
+const fakePlayit = path.join(tmp, "fake-playit.mjs");
+fs.writeFileSync(fakePlayit, `#!/usr/bin/env node
+import fs from 'node:fs';
 const a = process.argv.slice(2);
-if (a[0] === 'version') { console.log('ngrok version 3.99.0'); process.exit(0); }
-const tok = process.env.NGROK_AUTHTOKEN || '';
-if (process.env.FAKE_REC) fs.writeFileSync(process.env.FAKE_REC, JSON.stringify({ argv: a, tokenEnv: tok, pid: process.pid }));
-const port = a[1];
+if (a[0] === '--version') { console.log('playit 1.0.10'); process.exit(0); }
+const sec = process.env.SECRET_KEY || '';
+if (process.env.FAKE_REC) fs.writeFileSync(process.env.FAKE_REC, JSON.stringify({ argv: a, secretEnv: sec, plEnv: process.env.PLAYIT_SECRET || '', pid: process.pid }));
 const L = (s) => console.log(s);
-const url = (h, p) => L('t=2026-01-01T00:00:00+0000 lvl=info msg="started tunnel" obj=tunnels name=command_line addr=//localhost:' + port + ' url=tcp://' + h + ':' + p);
-if (tok.startsWith('badtoken')) { L('t=x lvl=eror msg="failed to auth" err="authentication failed: The authtoken you specified is invalid. ERR_NGROK_105"'); process.exit(1); }
-if (tok.startsWith('needcard')) { L('t=x lvl=eror msg="failed" err="You must add a credit or debit card before you can use TCP endpoints"'); process.exit(1); }
-if (tok.startsWith('dnsfail')) { L('t=x lvl=eror msg="failed" err="dial tcp: lookup connect.ngrok-agent.com on [::1]:53: read udp: connection refused"'); process.exit(1); }
-if (tok.startsWith('busyagent')) { L('t=x lvl=eror msg="failed" err="Your account is limited to 1 simultaneous ngrok agent sessions. ERR_NGROK_108"'); process.exit(1); }
-if (tok.startsWith('silent')) { L('t=x lvl=info msg="connecting"'); setInterval(() => {}, 1000); }
-else if (tok.startsWith('apionly')) {
-  http.createServer((q, r) => r.end(JSON.stringify({ tunnels: [{ public_url: 'tcp://9.tcp.fake.io:9999', config: { addr: 'localhost:1' } }, { public_url: 'tcp://7.tcp.fake.io:7777', config: { addr: 'localhost:' + port } }] }))).listen(Number(process.env.FAKE_NGROK_API));
-  L('t=x lvl=info msg="no tunnel info in this log format"');
-}
-else if (tok.startsWith('decoy')) { L('t=x lvl=info msg="session" addr=tcp://connect.ngrok-agent.com:443'); setTimeout(() => url('0.tcp.fake.io', 12345), 300); setInterval(() => {}, 1000); }
-else if (tok.startsWith('crashy')) { url('0.tcp.fake.io', 12345); setTimeout(() => process.exit(1), 800); }
-else { L('t=x lvl=info msg="debug" tokenIs=' + tok); url('0.tcp.fake.io', 12345); setInterval(() => {}, 1000); }
+if (sec.startsWith('badsecret')) { L('error: the secret key was rejected: unauthorized'); process.exit(1); }
+if (sec.startsWith('crashy')) { L('agent connected'); setTimeout(() => process.exit(3), 1600); }
+else if (!sec) { L('\\x1b[32mVisit link to setup https://playit.gg/claim/abcd1234EFGH\\x1b[0m'); setInterval(() => {}, 1000); }
+else { L('agent started, secret is ' + sec); setInterval(() => {}, 1000); }
 `, { mode: 0o755 });
-const fakeChroot = path.join(tmp, "fake-chroot.sh");
-fs.writeFileSync(fakeChroot, '#!/bin/sh\necho ran > "$FAKE_CHROOT_MARK"\nexec "$@"\n', { mode: 0o755 });
-const ngrokRec = path.join(tmp, "ngrok-rec.json");
-process.env.FAKE_REC = ngrokRec;
-process.env.FAKE_CHROOT_MARK = path.join(tmp, "chroot-mark");
+const playitRec = path.join(tmp, "playit-rec.json");
+process.env.FAKE_REC = playitRec;
+const SECRET = "goodsecret0123456789abcdef0123456789abcdef";
 
 let app, base, cookie = "";
 const call = async (method, url, body, extra = {}) => {
@@ -70,8 +60,6 @@ const call = async (method, url, body, extra = {}) => {
 const waitFor = async (fn, ms = 8000) => { const end = Date.now() + ms; while (Date.now() < end) { const v = await fn(); if (v) return v; await new Promise((r) => setTimeout(r, 50)); } throw new Error("timeout"); };
 
 before(async () => {
-  const apiPort = await new Promise((r) => { const sv = net.createServer().listen(0, "127.0.0.1", () => { const p = sv.address().port; sv.close(() => r(p)); }); });
-  process.env.FAKE_NGROK_API = String(apiPort);
   const modrinth = {
     search: async (q, gameVersion) => { if (q === "boom") throw new Error("offline"); return [{ id: "AbCd1234", slug: "demo", title: "Demo " + q, description: "d", downloads: 5, author: "me", gv: gameVersion }]; },
     install: async (project, gameVersion, destDir) => {
@@ -82,7 +70,7 @@ before(async () => {
     },
   };
   app = createApp({ dataDir: path.join(tmp, "data"), java: fakeJava, port: 0, host: "127.0.0.1", modrinth, crashRestartDelayMs: 150, backupSettleMs: 50, sampleMs: 100,
-    ngrokPaths: ["/nonexistent/ngrok", fakeNgrok], ngrokApiPort: apiPort, ngrokStartTimeoutMs: 3500, chrootCmd: fakeChroot });
+    playitPaths: ["/nonexistent/playit", fakePlayit], playitGraceMs: 700 });
   const p = await app.listen();
   base = `http://127.0.0.1:${p}`;
 });
@@ -497,172 +485,153 @@ test("deleting a server also removes its backups", async () => {
 });
 
 // ---------------------------------------------------------------------------------------
-// ngrok tunnel (fake ngrok binary)
-// ---------------------------------------------------------------------------------------
-const ngrokState = async () => (await call("GET", "/api/ngrok")).json;
-const waitTunnel = (st) => waitFor(async () => (await ngrokState()).tunnel.state === st, 9000);
-const goodToken = "goodtoken_1234567890abcdef";
+// playit.gg
+const pl = async () => (await call("GET", "/api/playit")).json;
+const waitAgent = (st) => waitFor(async () => (await pl()).agent.state === st, 9000);
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-const useToken = async (tok) => { await call("POST", "/api/ngrok/stop", {}); return call("PUT", "/api/ngrok/settings", { authtoken: tok }); };
-let tA, tB;
+const rec = () => JSON.parse(fs.readFileSync(playitRec, "utf8"));
+const mkSrv = async (name, port) => (await call("POST", "/api/servers", { name, type: "custom", ramMb: 512, port, eulaAccepted: true })).json.server.id;
 
-test("ngrok: finds the binary (skipping missing candidates); token handling and validation", async () => {
-  const mk = async (name, port) => (await call("POST", "/api/servers", { name, type: "custom", ramMb: 512, port, eulaAccepted: true })).json.server.id;
-  tA = await mk("Tun A", 25601); tB = await mk("Tun B", 25602);
-  let n = await ngrokState();
-  assert.equal(n.installed, true);
-  assert.equal(n.binaryPath, fakeNgrok);
-  assert.equal(n.version, "ngrok version 3.99.0");
-  assert.equal(n.tokenSet, false);
-  assert.equal(n.tunnel.state, "idle");
-  assert.equal((await call("POST", "/api/ngrok/start", { serverId: tA })).status, 400, "no token yet");
-  for (const bad of ["short", "has spaces in it 1234567890", "x".repeat(121), "bad;token;1234567890abc", 123]) assert.equal((await call("PUT", "/api/ngrok/settings", { authtoken: bad })).status, 400, String(bad));
-  assert.equal((await call("PUT", "/api/ngrok/settings", { useChroot: "yes" })).status, 400);
-  assert.equal((await call("PUT", "/api/ngrok/settings", { authtoken: goodToken })).status, 200);
-  n = await ngrokState();
-  assert.equal(n.tokenSet, true);
-  assert.equal(n.tokenHint, "cdef");
-  assert.ok(!JSON.stringify(n).includes(goodToken), "the token is never sent back to the browser");
+test("playit helpers: address cleaning, secret check, advice text", () => {
+  assert.equal(cleanAddress("XX-XX.craft.playit.gg"), "xx-xx.craft.playit.gg");
+  assert.equal(cleanAddress(" https://abc.ply.gg:12345/ "), "abc.ply.gg:12345");
+  assert.equal(cleanAddress("147.185.221.9:25565"), "147.185.221.9:25565");
+  for (const bad of ["", "nodots", "a b.gg", "x.gg:0", "x.gg:99999", "x.gg:abc", "-x.gg", "x..gg", 5, null]) assert.equal(cleanAddress(bad), null, String(bad));
+  assert.equal(validSecret(SECRET), true);
+  for (const bad of ["short", "has space 0123456789abcdef", "a;b0123456789abcdef", SECRET + "\n", 5]) assert.equal(validSecret(bad), false);
+  assert.match(diagnose("error: the secret key was rejected: unauthorized"), /secret key/);
+  assert.match(diagnose("fork/exec: exec format error"), /ARM64/);
+  assert.match(diagnose("bash: permission denied"), /chmod \+x/);
+  assert.equal(diagnose("all good"), null);
+});
+
+test("playit: finds the program (skips missing ones); secret validation, privacy, auth", async () => {
+  let d = await pl();
+  assert.equal(d.installed, true); assert.equal(d.binaryPath, fakePlayit); assert.equal(d.version, "playit 1.0.10");
+  assert.equal(d.secretSet, false);
+  const put = (b) => call("PUT", "/api/playit/settings", b);
+  for (const bad of ["short", "has space 0123456789abcdef", "x;y0123456789abcdefg", 5]) assert.equal((await put({ secret: bad })).status, 400, String(bad));
+  assert.equal((await put({})).status, 400);
+  const r = await put({ secret: SECRET });
+  assert.equal(r.status, 200); assert.ok(!r.text.includes(SECRET), "secret not echoed");
+  d = await pl();
+  assert.equal(d.secretSet, true); assert.equal(d.secretHint, SECRET.slice(-4)); assert.equal(d.secretSource, "panel");
+  assert.ok(!JSON.stringify(d).includes(SECRET), "secret never returned to the browser");
   const dbFile = path.join(tmp, "data", "db.json");
-  assert.equal(fs.statSync(dbFile).mode & 0o777, 0o600, "database file is private to the owner");
-  const saved = cookie; cookie = "";
-  try { for (const [m, u] of [["GET", "/api/ngrok"], ["PUT", "/api/ngrok/settings"], ["POST", "/api/ngrok/start"], ["POST", "/api/ngrok/stop"]]) assert.equal((await call(m, u, m === "GET" ? undefined : {})).status, 401, u); }
-  finally { cookie = saved; }
+  assert.equal(JSON.parse(fs.readFileSync(dbFile, "utf8")).playit.secret, SECRET);
+  assert.equal(fs.statSync(dbFile).mode & 0o777, 0o600);
+  for (const [m, u] of [["GET", "/api/playit"], ["PUT", "/api/playit/settings"], ["PUT", "/api/playit/address"], ["POST", "/api/playit/start"], ["POST", "/api/playit/stop"]])
+    assert.equal((await fetch(base + u, { method: m, headers: { "X-Requested-With": "minepanel", "Content-Type": "application/json" }, body: m === "GET" ? undefined : "{}" })).status, 401, u);
 });
 
-test("ngrok: tunnel goes online, shows the public address, token goes in env not argv, token is redacted in logs", async () => {
-  assert.equal((await call("POST", "/api/ngrok/start", { serverId: "nope" })).status, 404);
-  assert.equal((await call("POST", "/api/ngrok/start", { serverId: tA })).status, 200);
-  await waitTunnel("online");
-  const n = await ngrokState();
-  assert.equal(n.tunnel.address, "0.tcp.fake.io:12345");
-  assert.equal(n.tunnel.serverId, tA);
-  const rec = JSON.parse(fs.readFileSync(ngrokRec, "utf8"));
-  assert.deepEqual(rec.argv, ["tcp", "25601", "--log=stdout"]);
-  assert.equal(rec.tokenEnv, goodToken, "token reaches ngrok through NGROK_AUTHTOKEN");
-  assert.ok(!rec.argv.join(" ").includes(goodToken), "token is not on the command line");
-  const logs = n.tunnel.logs.join("\n");
-  assert.ok(!logs.includes(goodToken) && logs.includes("tokenIs=***"), "token is redacted from logs");
-  assert.equal((await getServer(tA)).publicAddress, "0.tcp.fake.io:12345");
-  assert.equal((await getServer(tB)).publicAddress, null);
-  const list = (await call("GET", "/api/servers")).json.servers;
-  assert.equal(list.find((s) => s.id === tA).publicAddress, "0.tcp.fake.io:12345");
+test("playit agent: starts with the secret in the environment (not argv), runs, redacts logs, Stop kills it", async () => {
+  assert.equal((await call("POST", "/api/playit/start", {})).status, 200);
+  assert.equal((await pl()).agent.state, "starting");
+  await waitAgent("running");
+  const r = rec();
+  assert.deepEqual(r.argv, [], "no command-line arguments, so the secret can't show in `ps`");
+  assert.equal(r.secretEnv, SECRET); assert.equal(r.plEnv, SECRET);
+  const d = await pl();
+  assert.ok(d.agent.logs.some((l) => l.includes("agent started, secret is ***")), "secret redacted in logs");
+  assert.ok(!JSON.stringify(d).includes(SECRET));
+  assert.equal((await call("PUT", "/api/playit/settings", { secret: "othersecret0123456789abcdef" })).status, 409, "locked while running");
+  assert.equal((await call("POST", "/api/playit/start", {})).status, 200, "starting twice is harmless");
+  assert.ok(alive(rec().pid));
+  const pid = rec().pid;
+  assert.equal((await call("POST", "/api/playit/stop", {})).status, 200);
+  assert.equal((await pl()).agent.state, "idle");
+  await waitFor(() => !alive(pid), 4000);
 });
 
-test("ngrok: settings and port are locked while the tunnel runs; starting another server switches the tunnel", async () => {
-  assert.equal((await call("PUT", "/api/ngrok/settings", { authtoken: "othertoken_1234567890abc" })).status, 409);
-  assert.equal((await call("PATCH", `/api/servers/${tA}`, { port: 25611 })).status, 409);
-  assert.equal((await call("PATCH", `/api/servers/${tB}`, { port: 25612 })).status, 200, "other servers are unaffected");
-  await call("PATCH", `/api/servers/${tB}`, { port: 25602 });
-  const pid1 = JSON.parse(fs.readFileSync(ngrokRec, "utf8")).pid;
-  assert.equal((await call("POST", "/api/ngrok/start", { serverId: tB })).status, 200);
-  await waitFor(async () => { const t = (await ngrokState()).tunnel; return t.state === "online" && t.serverId === tB; });
-  assert.ok(!alive(pid1), "the first ngrok process was stopped");
-  assert.equal(JSON.parse(fs.readFileSync(ngrokRec, "utf8")).argv[1], "25602");
-  assert.equal((await getServer(tA)).publicAddress, null);
-  assert.equal((await getServer(tB)).publicAddress, "0.tcp.fake.io:12345");
+test("playit agent: without a secret the claim link is shown; a parent SECRET_KEY is not leaked to it", async () => {
+  process.env.SECRET_KEY = "parentsecret_should_not_pass_0123456789";
+  try {
+    assert.equal((await call("PUT", "/api/playit/settings", { secret: "" })).status, 200);
+    assert.equal((await pl()).secretSet, false);
+    assert.equal((await call("POST", "/api/playit/start", {})).status, 200);
+    await waitFor(async () => (await pl()).agent.claimUrl, 5000);
+    assert.equal((await pl()).agent.claimUrl, "https://playit.gg/claim/abcd1234EFGH", "colour codes stripped, link found");
+    assert.equal(rec().secretEnv, "");
+  } finally { delete process.env.SECRET_KEY; await call("POST", "/api/playit/stop", {}); }
 });
 
-test("ngrok: Stop really kills the process; deleting a server stops its tunnel", async () => {
-  const pid = JSON.parse(fs.readFileSync(ngrokRec, "utf8")).pid;
-  assert.ok(alive(pid));
-  assert.equal((await call("POST", "/api/ngrok/stop", {})).status, 200);
-  assert.ok(!alive(pid), "process is gone");
-  const n = await ngrokState();
-  assert.equal(n.tunnel.state, "idle");
-  assert.equal((await getServer(tB)).publicAddress, null);
-  await call("POST", "/api/ngrok/start", { serverId: tB });
-  await waitTunnel("online");
-  const pid2 = JSON.parse(fs.readFileSync(ngrokRec, "utf8")).pid;
-  assert.equal((await call("DELETE", `/api/servers/${tB}`)).status, 200);
-  assert.ok(!alive(pid2), "deleting the server stopped its tunnel");
-  assert.equal((await ngrokState()).tunnel.state, "idle");
+test("playit agent: rejected secret and later crash both end in an honest error with advice", async () => {
+  await call("PUT", "/api/playit/settings", { secret: "badsecret0123456789abcdef" });
+  await call("POST", "/api/playit/start", {});
+  await waitAgent("error");
+  let a = (await pl()).agent;
+  assert.match(a.error, /stopped \(code 1\)/); assert.match(a.hint, /rejected the secret key/);
+  await call("PUT", "/api/playit/settings", { secret: "crashy0123456789abcdef0123" });
+  await call("POST", "/api/playit/start", {});
+  await waitAgent("running");
+  await waitAgent("error");
+  a = (await pl()).agent;
+  assert.match(a.error, /code 3/); assert.match(a.error, /no longer works/);
+  await call("PUT", "/api/playit/settings", { secret: SECRET });
 });
 
-test("ngrok: each failure shows a helpful message", async () => {
-  const cases = [
-    ["badtoken_1234567890abcdef", /rejected the auth token/],
-    ["needcard_1234567890abcdef", /credit or debit card/],
-    ["dnsfail_1234567890abcdef", /termux-chroot/],
-    ["busyagent_1234567890abcdef", /pkill ngrok/],
-  ];
-  for (const [tok, re] of cases) {
-    assert.equal((await useToken(tok)).status, 200);
-    assert.equal((await call("POST", "/api/ngrok/start", { serverId: tA })).status, 200);
-    await waitTunnel("error");
-    const t = (await ngrokState()).tunnel;
-    assert.match(t.hint, re, tok);
-    assert.match(t.error, /exited before giving an address/);
-    assert.equal(t.address, null);
-    assert.equal((await getServer(tA)).publicAddress, null, "never shows an address that does not work");
-  }
-});
-
-test("ngrok: silent ngrok times out and is killed; crash after going online clears the address", async () => {
-  await useToken("silent_1234567890abcdef");
-  await call("POST", "/api/ngrok/start", { serverId: tA });
-  const pid = await waitFor(async () => { try { return JSON.parse(fs.readFileSync(ngrokRec, "utf8")).pid; } catch { return null; } });
-  await waitTunnel("error");
-  const t = (await ngrokState()).tunnel;
-  assert.match(t.error, /did not report an address within 4 seconds|did not report an address/);
-  await waitFor(async () => !alive(pid), 4000);
-
-  await useToken("crashy_1234567890abcdef");
-  await call("POST", "/api/ngrok/start", { serverId: tA });
-  await waitTunnel("online");
-  assert.equal((await getServer(tA)).publicAddress, "0.tcp.fake.io:12345");
-  await waitTunnel("error");
-  assert.match((await ngrokState()).tunnel.error, /stopped unexpectedly/);
-  assert.equal((await getServer(tA)).publicAddress, null);
-});
-
-test("ngrok: address found through ngrok's local API when logs differ; log decoys are ignored", async () => {
-  await useToken("apionly_1234567890abcdef");
-  await call("POST", "/api/ngrok/start", { serverId: tA });
-  await waitTunnel("online");
-  assert.equal((await ngrokState()).tunnel.address, "7.tcp.fake.io:7777", "matched the tunnel for OUR port, not the other one");
-
-  await useToken("decoy_1234567890abcdef");
-  await call("POST", "/api/ngrok/start", { serverId: tA });
-  await new Promise((r) => setTimeout(r, 150));
-  assert.equal((await ngrokState()).tunnel.state, "starting", "a tcp:// address that is not a tunnel url is not mistaken for one");
-  await waitTunnel("online");
-  assert.equal((await ngrokState()).tunnel.address, "0.tcp.fake.io:12345");
-});
-
-test("ngrok: optional termux-chroot mode runs ngrok through the wrapper", async () => {
-  await useToken(goodToken);
-  fs.rmSync(process.env.FAKE_CHROOT_MARK, { force: true });
-  assert.equal((await call("PUT", "/api/ngrok/settings", { useChroot: true })).status, 200);
-  assert.equal((await ngrokState()).useChroot, true);
-  await call("POST", "/api/ngrok/start", { serverId: tA });
-  await waitTunnel("online");
-  assert.ok(fs.existsSync(process.env.FAKE_CHROOT_MARK), "wrapper was used");
-  assert.deepEqual(JSON.parse(fs.readFileSync(ngrokRec, "utf8")).argv, ["tcp", "25601", "--log=stdout"]);
-  await call("POST", "/api/ngrok/stop", {});
-  await call("PUT", "/api/ngrok/settings", { useChroot: false });
-  fs.rmSync(process.env.FAKE_CHROOT_MARK, { force: true });
-  await call("POST", "/api/ngrok/start", { serverId: tA });
-  await waitTunnel("online");
-  assert.ok(!fs.existsSync(process.env.FAKE_CHROOT_MARK), "wrapper not used when switched off");
-  await call("POST", "/api/ngrok/stop", {});
-  assert.equal((await call("PUT", "/api/ngrok/settings", { authtoken: "" })).status, 200, "empty token removes it");
-  assert.equal((await ngrokState()).tokenSet, false);
-});
-
-test("ngrok manager: not installed, missing chroot, token validation, advice text", async () => {
-  const settings = { authtoken: goodToken };
-  const none = new NgrokManager({ getSettings: () => settings, candidates: ["/nonexistent/ngrok"] });
+test("playit: not installed gives a clear refusal; missing program errors do not crash the panel", async () => {
+  const none = new PlayitManager({ getSettings: () => ({}), candidates: ["/nonexistent/playit"] });
   assert.equal(await none.locate(), null);
-  await assert.rejects(() => none.start("x", 25565), /not installed/);
-  const noChroot = new NgrokManager({ getSettings: () => ({ ...settings, useChroot: true }), candidates: [fakeNgrok], chrootCmd: "/nonexistent/chroot-cmd" });
-  await noChroot.start("x", 25565);
-  await waitFor(async () => noChroot.view().state === "error");
-  assert.match(noChroot.view().error, /pkg install proot/);
-  await assert.rejects(() => new NgrokManager({ getSettings: () => ({}), candidates: [fakeNgrok] }).start("x", 1), /auth token/);
-  assert.equal(validToken("abcdefghijklmnop"), true);
-  assert.equal(validToken("abc"), false);
-  assert.equal(validToken("abcdefghijklmnop;rm"), false);
-  assert.equal(diagnose("everything is fine"), null);
-  assert.equal(diagnose("lvl=info msg=hello"), null);
+  await assert.rejects(() => none.start(), /not installed/);
+  const notExec = path.join(tmp, "not-exec"); fs.writeFileSync(notExec, "x", { mode: 0o644 });
+  assert.equal(await new PlayitManager({ getSettings: () => ({}), candidates: [notExec] }).locate(), null, "a non-executable file is not 'installed'");
+});
+
+test("tunnel address is saved per server, validated, shown as the server's public address, and removed with the server", async () => {
+  const a = await mkSrv("Pub A", 25565), b = await mkSrv("Pub B", 25611);
+  const put = (serverId, address) => call("PUT", "/api/playit/address", { serverId, address });
+  assert.equal((await put(a, "not an address")).status, 400);
+  assert.equal((await put("nope", "x.craft.playit.gg")).status, 404);
+  assert.equal((await getServer(a)).publicAddress, null);
+  assert.equal((await put(a, "Alpha-Beta.craft.playit.gg")).status, 200);
+  assert.equal((await put(b, "https://gamma.ply.gg:41234/")).status, 200);
+  assert.equal((await getServer(a)).publicAddress, "alpha-beta.craft.playit.gg");
+  assert.equal((await getServer(b)).publicAddress, "gamma.ply.gg:41234");
+  assert.equal((await put(a, "")).status, 200);
+  assert.equal((await getServer(a)).publicAddress, null);
+  await call("DELETE", `/api/servers/${b}`);
+  assert.equal((await pl()).addresses[b], undefined, "address removed with the server");
+  await call("DELETE", `/api/servers/${a}`);
+});
+
+test("server-ip is kept blank; java gets the normal arguments; new servers write server-ip= and server-port", async () => {
+  const sid = await mkSrv("Blank IP", 25565);
+  const pf = path.join(tmp, "data", "servers", sid, "server.properties");
+  const text = fs.readFileSync(pf, "utf8");
+  assert.match(text, /^server-ip=$/m); assert.match(text, /^server-port=25565$/m);
+  await call("PUT", `/api/servers/${sid}/upload?path=server.jar`, new Uint8Array([1]));
+  fs.writeFileSync(pf, text.replace(/^server-ip=$/m, "server-ip=192.168.1.38"));
+  assert.equal((await call("POST", `/api/servers/${sid}/start`, {})).status, 200);
+  await waitStatus(sid, "running");
+  assert.match(fs.readFileSync(pf, "utf8"), /^server-ip=$/m, "server-ip reset to blank");
+  const argv = logsOf(sid).find((l) => l.startsWith("ARGV: ")).slice(6).split(" ");
+  assert.deepEqual(argv, ["-Xmx512M", "-Xms256M", "-jar", "server.jar", "nogui"]);
+  assert.equal((await call("PUT", `/api/servers/${sid}/properties`, { properties: { "server-ip": "10.0.0.1", "max-players": "7" } })).status, 200);
+  const props = (await call("GET", `/api/servers/${sid}/properties`)).json.properties;
+  assert.equal(props["server-ip"], ""); assert.equal(props["max-players"], "7");
+  await call("POST", `/api/servers/${sid}/stop`, {}); await waitStatus(sid, "stopped");
+  await call("DELETE", `/api/servers/${sid}`);
+});
+
+test("old ngrok and DuckDNS settings (and their tokens) are wiped from disk on start", async () => {
+  const dir = fs.mkdtempSync(path.join(tmp, "app2-"));
+  fs.writeFileSync(path.join(dir, "db.json"), JSON.stringify({ ngrok: { authtoken: "oldngroktoken_1234567890" }, duckdns: { token: "oldducktoken-1234567890" }, users: [], sessions: [] }));
+  const a2 = createApp2({ dataDir: dir, java: fakeJava, port: 0, host: "127.0.0.1", playit: { secret: "envsecret0123456789abcdef" }, playitPaths: [fakePlayit] });
+  try {
+    const raw = fs.readFileSync(path.join(dir, "db.json"), "utf8");
+    assert.ok(!/ngrok|duckdns|oldngroktoken|oldducktoken/.test(raw), "old settings removed from db.json");
+    assert.equal(a2.playit.getSettings().secret, "envsecret0123456789abcdef", ".env secret is the fallback");
+    a2.store.data.playit.secret = "panelsecret0123456789abcdef";
+    assert.equal(a2.playit.getSettings().secret, "panelsecret0123456789abcdef", "panel value wins");
+  } finally { await a2.close(); }
+});
+
+test("ngrok and DuckDNS are gone from the project", () => {
+  const root = path.join(import.meta.dirname, "..");
+  const hits = [];
+  const ok = /store\.data\[k\]|Those features are gone|older version|older versions|ngrok \/ DuckDNS|ngrok and DuckDNS|ngrok|duckdns/i;
+  const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { if (["node_modules", "data", ".git"].includes(e.name)) continue; const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else if (f !== import.meta.filename && (/ngrok|duck/i.test(e.name) || fs.readFileSync(f, "utf8").split("\n").some((l) => /ngrok|duckdns/i.test(l) && !/Older versions kept|for \(const k of \["ngrok"|older version|old ngrok/i.test(l)))) hits.push(path.relative(root, f)); } };
+  walk(root);
+  assert.deepEqual(hits, [], "no file mentions them (except the one cleanup line and the README note)");
 });

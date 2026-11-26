@@ -167,3 +167,4 @@ td.right { text-align: right; white-space: nowrap; }
   .stat .value { font-size: 19px; }
 }
 @media (max-width: 420px) { .stats, .stats.five { grid-template-columns: 1fr 1fr; gap: 8px; } .bar-row { grid-template-columns: 36px 1fr 84px; } }
+.kv { margin-bottom: 6px; }
