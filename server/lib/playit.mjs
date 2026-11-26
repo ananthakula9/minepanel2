@@ -24,6 +24,8 @@ export function cleanAddress(v) {
 export function diagnose(text) {
   if (/exec format error|cannot execute binary|bad cpu type/i.test(text))
     return "This playit file is for a different kind of device. On a phone you need the Linux ARM64 (aarch64) build.";
+  if (/not a terminal|no tty|inappropriate ioctl|device not configured|not a tty|failed to initiali[sz]e terminal|enable raw mode/i.test(text))
+    return "playit wanted a terminal screen. The panel starts it in plain-text mode, so this means your playit version behaves differently. Run ~/playit once directly in Termux to link it to your account, then press Start agent again.";
   if (/permission denied/i.test(text)) return "Android refused to run the file. In Termux run: chmod +x ~/playit";
   if (/secret.{0,40}(invalid|not found|rejected|unauthori[sz]ed)|(invalid|unknown|bad).{0,20}secret|unauthori[sz]ed|\b401\b/i.test(text))
     return "playit rejected the secret key. Create a new agent at playit.gg/account/agents and save its secret key here.";
@@ -75,16 +77,21 @@ export class PlayitManager {
   }
   fail(message) { clearTimeout(this.grace); this.t.state = "error"; this.t.error = message; this.t.hint = diagnose(this.t.logs.join("\n")); }
 
+  // Newer playit versions draw a terminal screen unless told to print plain logs (--stdout); older ones may not know that flag, so retry without it.
   async start() {
     if (this.isActive()) return;
     const bin = await this.locate();
     if (!bin) throw new Error("playit is not installed on this device");
     this.reset();
     this.t.state = "starting";
+    this.launch(bin.path, [["--stdout"], []], 0);
+  }
+
+  launch(binPath, attempts, n) {
     const secret = this.getSettings().secret;
     const env = { ...process.env }; delete env.SECRET_KEY; delete env.PLAYIT_SECRET;
     if (validSecret(secret)) { env.SECRET_KEY = secret; env.PLAYIT_SECRET = secret; }
-    const child = spawn(bin.path, [], { env, stdio: ["ignore", "pipe", "pipe"], detached: true });
+    const child = spawn(binPath, attempts[n], { env, stdio: ["ignore", "pipe", "pipe"], detached: true });
     this.child = child;
     let buf = "";
     const onData = (d) => { buf += d.toString("utf8"); let i; while ((i = buf.search(/[\r\n]/)) >= 0) { this.log(buf.slice(0, i)); buf = buf.slice(i + 1); } };
@@ -93,9 +100,16 @@ export class PlayitManager {
     child.on("close", (code, signal) => {
       if (this.child !== child) return;
       this.child = null; if (buf.trim()) this.log(buf);
-      if (!this.stopping) this.fail(`playit stopped (${code !== null ? `code ${code}` : signal}), so the public address no longer works`);
+      if (this.stopping) return;
+      const recent = this.t.logs.slice(-5).join("\n");
+      if (this.t.state === "starting" && n + 1 < attempts.length && /unexpected argument|unknown (option|argument|flag)|unrecogni[sz]ed|found argument/i.test(recent)) {
+        this.log(`(this playit version does not know ${attempts[n].join(" ")}; trying again without it)`);
+        return this.launch(binPath, attempts, n + 1);
+      }
+      this.fail(`playit stopped (${code !== null ? `code ${code}` : signal}), so the public address no longer works`);
     });
     // "running" only means the program is still alive after a few seconds. Whether it is connected is shown in its own log and on playit.gg.
+    clearTimeout(this.grace);
     this.grace = setTimeout(() => { if (this.child === child && this.t.state === "starting") { this.t.state = "running"; this.t.startedAt = Date.now(); } }, this.graceMs);
     this.grace.unref?.();
   }

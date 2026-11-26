@@ -36,6 +36,8 @@ if (a[0] === '--version') { console.log('playit 1.0.10'); process.exit(0); }
 const sec = process.env.SECRET_KEY || '';
 if (process.env.FAKE_REC) fs.writeFileSync(process.env.FAKE_REC, JSON.stringify({ argv: a, secretEnv: sec, plEnv: process.env.PLAYIT_SECRET || '', pid: process.pid }));
 const L = (s) => console.log(s);
+if (process.env.FAKE_OLD === '1' && a.includes('--stdout')) { L("error: unexpected argument '--stdout' found"); process.exit(2); }
+if (process.env.FAKE_OLD !== '1' && !a.includes('--stdout')) { L('Error: not a terminal (no tty)'); process.exit(1); }
 if (sec.startsWith('badsecret')) { L('error: the secret key was rejected: unauthorized'); process.exit(1); }
 if (sec.startsWith('crashy')) { L('agent connected'); setTimeout(() => process.exit(3), 1600); }
 else if (!sec) { L('\\x1b[32mVisit link to setup https://playit.gg/claim/abcd1234EFGH\\x1b[0m'); setInterval(() => {}, 1000); }
@@ -529,7 +531,7 @@ test("playit agent: starts with the secret in the environment (not argv), runs, 
   assert.equal((await pl()).agent.state, "starting");
   await waitAgent("running");
   const r = rec();
-  assert.deepEqual(r.argv, [], "no command-line arguments, so the secret can't show in `ps`");
+  assert.deepEqual(r.argv, ["--stdout"], "plain-log mode, and nothing secret on the command line (visible in `ps`)");
   assert.equal(r.secretEnv, SECRET); assert.equal(r.plEnv, SECRET);
   const d = await pl();
   assert.ok(d.agent.logs.some((l) => l.includes("agent started, secret is ***")), "secret redacted in logs");
@@ -553,6 +555,18 @@ test("playit agent: without a secret the claim link is shown; a parent SECRET_KE
     assert.equal((await pl()).agent.claimUrl, "https://playit.gg/claim/abcd1234EFGH", "colour codes stripped, link found");
     assert.equal(rec().secretEnv, "");
   } finally { delete process.env.SECRET_KEY; await call("POST", "/api/playit/stop", {}); }
+});
+
+test("playit agent: an older version that does not know --stdout is retried without it", async () => {
+  process.env.FAKE_OLD = "1";
+  try {
+    await call("PUT", "/api/playit/settings", { secret: SECRET });
+    assert.equal((await call("POST", "/api/playit/start", {})).status, 200);
+    await waitAgent("running");
+    assert.deepEqual(rec().argv, []);
+    assert.ok((await pl()).agent.logs.some((l) => /trying again without it/.test(l)));
+    await call("POST", "/api/playit/stop", {});
+  } finally { delete process.env.FAKE_OLD; }
 });
 
 test("playit agent: rejected secret and later crash both end in an honest error with advice", async () => {

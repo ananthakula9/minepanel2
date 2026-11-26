@@ -46,7 +46,7 @@ Players on your Wi-Fi join with `your-phone-ip:port`.
 
 Open a server, then the **Online** tab:
 1. **Install the agent** (once). In Termux: `curl -SsL -o ~/playit https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-aarch64` then `chmod +x ~/playit`. The panel finds it on PATH or at `~/playit` (or set `PLAYIT=/full/path` in `.env`).
-2. **Connect the agent.** Press **Start agent**. If it prints a claim link, the panel shows a button to open it; sign in to playit.gg. Or create an agent at playit.gg/account/agents and save its secret key in the tab (it is passed to the agent as the `SECRET_KEY` environment variable, never on the command line, and is not shown again).
+2. **Connect the agent.** Press **Start agent** (the panel runs it with `--stdout` for plain-text logs, and retries without that flag for older versions). If no claim link appears, run `~/playit` once in Termux, open the link it prints, then press Start agent again. If it prints a claim link, the panel shows a button to open it; sign in to playit.gg. Or create an agent at playit.gg/account/agents and save its secret key in the tab (it is passed to the agent as the `SECRET_KEY` environment variable, never on the command line, and is not shown again).
 3. **Create the tunnel** on playit.gg/account/tunnels: Minecraft Java, local address `localhost:<your server's port>`. Copy the address it gives you, paste it in the tab, and Save. It then appears (with Copy) in the server header and on the dashboard.
 
 Players add that address in Minecraft. **Turn on `online-mode` before sharing it** (the tab warns you and has a one-tap button). `server-ip=` is kept blank (the panel resets it on start and the Properties editor won't change it).
@@ -84,7 +84,7 @@ These can also go in a `.env` file in the project folder (see `.env.example`).
 
 ## What has and hasn't been tested
 
-**Automated (`npm test`, 38 tests, using a fake Java that behaves like a Minecraft server and a fake playit agent):** login/setup/rate limiting, validation, start/stop/restart/kill, "Running" only after the Done line, crash reporting and auto-restart (including giving up after 3 crashes), console, live metrics, players, plugins, backups (including hostile archives and the 10-backup limit), file manager traversal/symlink blocking, properties, settings, deletion. I also broke three safety checks on purpose and confirmed the tests caught each.
+**Automated (`npm test`, 39 tests, using a fake Java that behaves like a Minecraft server and a fake playit agent):** login/setup/rate limiting, validation, start/stop/restart/kill, "Running" only after the Done line, crash reporting and auto-restart (including giving up after 3 crashes), console, live metrics, players, plugins, backups (including hostile archives and the 10-backup limit), file manager traversal/symlink blocking, properties, settings, deletion. I also broke three safety checks on purpose and confirmed the tests caught each.
 
 **Real browser (Chromium, desktop and phone size):** 18 click-through steps covering every page, with no JavaScript errors or security-policy violations.
 
